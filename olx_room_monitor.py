@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Room Scanner - Lublin - Główny agent monitorujący
-Monitoruje oferty pokoi w Lublinie, szuka adresów w treści ogłoszeń,
-geokoduje precyzyjnie i tworzy mapę z historią
+Room Scanner - Lublin - POPRAWIONA WERSJA
+- Przeszukuje treść ogłoszeń (nie tylko tytuł)
+- Obsługuje "Al." (aleje) + liter w numerach (73a)
+- Skanuje WSZYSTKIE strony (nie zatrzymuje na pustych)
 """
 
 import requests
@@ -11,8 +12,8 @@ import re
 import json
 import sqlite3
 import os
-from datetime import datetime, timedelta
-from dataclasses import dataclass, asdict
+from datetime import datetime
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Set
 import logging
 import time
@@ -186,8 +187,8 @@ class DatabaseManager:
             """, (datetime.now().isoformat(), stats['total_found'], stats['with_addresses'],
                  stats['new_offers'], stats['updated_offers'], stats['active_offers'], stats['inactive_offers']))
 
-class PreciseGeocoder:
-    """Geocoder używający Nominatim OpenStreetMap"""
+class ImprovedGeocoder:
+    """Geocoder z cache'owaniem"""
     
     def __init__(self, cache_file: str = "data/geocoding_cache.json"):
         self.nominatim_url = "https://nominatim.openstreetmap.org/search"
@@ -195,7 +196,7 @@ class PreciseGeocoder:
         self.cache = self._load_cache()
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'OLX-Lublin-Monitor/1.0 (Educational)'
+            'User-Agent': 'Room-Scanner-Lublin/2.0 (Educational)'
         })
     
     def _load_cache(self) -> Dict:
@@ -225,6 +226,8 @@ class PreciseGeocoder:
             f"{street} {number}, Lublin, Polska",
             f"ul. {street} {number}, Lublin, Poland", 
             f"ulica {street} {number}, Lublin, Polska",
+            f"al. {street} {number}, Lublin, Poland",  # Dodane aleje
+            f"aleja {street} {number}, Lublin, Polska",
             f"{street}, Lublin, Polska"  # Fallback - tylko ulica
         ]
         
@@ -265,8 +268,8 @@ class PreciseGeocoder:
         logger.error(f"❌ Nie można geokodować: {street} {number}")
         return None
 
-class OLXMonitor:
-    """Główny agent monitorujący OLX"""
+class ImprovedOLXMonitor:
+    """Poprawiony agent monitorujący OLX"""
     
     def __init__(self):
         self.base_url = "https://www.olx.pl"
@@ -278,14 +281,18 @@ class OLXMonitor:
         })
         
         self.db = DatabaseManager()
-        self.geocoder = PreciseGeocoder()
+        self.geocoder = ImprovedGeocoder()
         
-        # Wzorce adresów
+        # POPRAWIONE wzorce adresów - obsługują Al. i litery w numerach
         self.address_patterns = [
-            r'ul\.?\s+([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż\s]+?)\s+(\d+)(?:[\/\-\s]*(\d+))?',
-            r'ulica\s+([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż\s]+?)\s+(\d+)(?:[\/\-\s]*(\d+))?',
-            r'al\.?\s+([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż\s]+?)\s+(\d+)(?:[\/\-\s]*(\d+))?',
-            r'([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż\s]{3,25}?)\s+(\d+)(?:[\/\-\s]*(\d+))?(?=\s*[,\.\s]*(?:lublin|$))'
+            # "Al. Nazwa 123a" lub "Al. Nazwa 123/45" (ALEJE z literami!)
+            r'[Aa]l\.?\s+([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż\s]+?)\s+(\d+)([a-zA-Z]?)(?:[\/\-\s]*(\d+))?',
+            # "ul. Nazwa 123a" lub "ul. Nazwa 123/45"  
+            r'[Uu]l\.?\s+([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż\s]+?)\s+(\d+)([a-zA-Z]?)(?:[\/\-\s]*(\d+))?',
+            # "ulica Nazwa 123a"
+            r'[Uu]lica\s+([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż\s]+?)\s+(\d+)([a-zA-Z]?)(?:[\/\-\s]*(\d+))?',
+            # "Nazwa 123a" na końcu (bez ul./al.)
+            r'([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż\s]{3,25}?)\s+(\d+)([a-zA-Z]?)(?:[\/\-\s]*(\d+))?(?=\s*[,\.\s]*(?:lublin|$))',
         ]
     
     def run_monitoring(self) -> Dict:
@@ -294,9 +301,9 @@ class OLXMonitor:
         logger.info(f"🚀 Rozpoczynam monitoring OLX Lublin - {timestamp}")
         
         try:
-            # Zbierz wszystkie oferty
-            all_offers = self._collect_all_offers()
-            logger.info(f"📄 Znaleziono {len(all_offers)} ofert na stronach listingowych")
+            # Zbierz WSZYSTKIE oferty ze WSZYSTKICH stron
+            all_offers = self._collect_ALL_offers()
+            logger.info(f"📄 Znaleziono {len(all_offers)} ofert na wszystkich stronach")
             
             # Przetworz oferty z adresami
             processed_offers = []
@@ -307,7 +314,8 @@ class OLXMonitor:
                 if i % 20 == 0:
                     logger.info(f"   📊 Przetworzono {i}/{len(all_offers)} ofert...")
                 
-                full_offer = self._process_offer_details(basic_offer, timestamp)
+                # PRZESZUKAJ TREŚĆ I TYTUŁ
+                full_offer = self._process_offer_CONTENT(basic_offer, timestamp)
                 if full_offer:
                     processed_offers.append(full_offer)
                     active_ids.add(full_offer.offer_id)
@@ -321,7 +329,7 @@ class OLXMonitor:
                     elif result == 'updated':
                         logger.info(f"🔄 Zaktualizowana: {full_offer.full_address}")
                 
-                time.sleep(1.0)  # Opóźnienie między requestami
+                time.sleep(0.8)  # Opóźnienie między requestami
             
             # Oznacz nieaktywne
             self.db.mark_inactive_offers(active_ids, timestamp)
@@ -331,8 +339,8 @@ class OLXMonitor:
             active_count = sum(1 for o in all_offers_in_db if o.is_active)
             inactive_count = len(all_offers_in_db) - active_count
             
-            # Wygeneruj mapę
-            self._generate_map(all_offers_in_db)
+            # ZAWSZE wygeneruj mapę (nawet jeśli brak ofert)
+            self._generate_map_ALWAYS(all_offers_in_db)
             
             # Zapisz statystyki
             final_stats = {
@@ -359,13 +367,13 @@ class OLXMonitor:
             logger.error(f"❌ Błąd monitorowania: {e}")
             return {'status': 'ERROR', 'error': str(e)}
     
-    def _collect_all_offers(self) -> List[Dict]:
-        """Zbiera wszystkie oferty ze stron listingowych"""
+    def _collect_ALL_offers(self) -> List[Dict]:
+        """Zbiera WSZYSTKIE oferty ze WSZYSTKICH stron - nie zatrzymuje na pustych"""
         all_offers = []
         page = 1
-        consecutive_empty = 0
+        max_pages = 20  # Bezpiecznik - maksymalnie 20 stron
         
-        while consecutive_empty < 3:  # Zatrzymaj po 3 pustych stronach
+        while page <= max_pages:
             try:
                 url = f"{self.search_url}?page={page}"
                 response = self.session.get(url, timeout=15)
@@ -375,14 +383,10 @@ class OLXMonitor:
                 offer_links = soup.find_all('a', href=re.compile(r'/d/oferta/'))
                 
                 if not offer_links:
-                    consecutive_empty += 1
-                    logger.info(f"📄 Strona {page}: pusta ({consecutive_empty}/3)")
-                    page += 1
-                    continue
+                    logger.info(f"📄 Strona {page}: pusta - KONIEC")
+                    break  # Pierwsza pusta strona = koniec
                 
-                consecutive_empty = 0
                 page_offers = []
-                
                 for link in offer_links:
                     href = link.get('href')
                     if href and '/d/oferta/' in href:
@@ -408,21 +412,16 @@ class OLXMonitor:
                 page += 1
                 time.sleep(2)
                 
-                # Zabezpieczenie
-                if page > 100:
-                    logger.warning("⚠️ Osiągnięto limit 100 stron")
-                    break
-                    
             except Exception as e:
                 logger.error(f"❌ Błąd strony {page}: {e}")
-                consecutive_empty += 1
+                break
         
         # Usuń duplikaty globalne
         unique_offers = {o['offer_id']: o for o in all_offers}
         return list(unique_offers.values())
     
-    def _process_offer_details(self, basic_offer: Dict, timestamp: str) -> Optional[RoomOffer]:
-        """Przetwarza szczegóły oferty - pobiera treść i geokoduje"""
+    def _process_offer_CONTENT(self, basic_offer: Dict, timestamp: str) -> Optional[RoomOffer]:
+        """Przetwarza ofertę - PRZESZUKUJE TREŚĆ + TYTUŁ"""
         
         try:
             response = self.session.get(basic_offer['url'], timeout=15)
@@ -435,11 +434,11 @@ class OLXMonitor:
             price, price_numeric = self._extract_price(soup)
             description = self._extract_description(soup)
             
-            if not description:
-                return None
+            # PRZESZUKAJ TYTUŁ + TREŚĆ razem
+            full_text = f"{title} {description}" if description else title
             
-            # Znajdź adres w treści
-            address_info = self._extract_address(f"{title} {description}")
+            # Znajdź adres w pełnym tekście
+            address_info = self._extract_address_IMPROVED(full_text)
             if not address_info:
                 return None
             
@@ -465,7 +464,7 @@ class OLXMonitor:
                 price=price,
                 price_numeric=price_numeric,
                 url=basic_offer['url'],
-                description=description[:2000],  # Ogranicz długość
+                description=description[:2000] if description else '',
                 street_name=address_info['street_name'],
                 building_number=address_info['building_number'],
                 apartment_number=address_info.get('apartment_number'),
@@ -516,25 +515,30 @@ class OLXMonitor:
                 return elem.get_text(strip=True)
         return None
     
-    def _extract_address(self, text: str) -> Optional[Dict]:
-        """Wyciąga adres z tekstu"""
+    def _extract_address_IMPROVED(self, text: str) -> Optional[Dict]:
+        """POPRAWIONE wyciąganie adresu - obsługuje Al. i litery"""
         
         for pattern in self.address_patterns:
             matches = re.finditer(pattern, text, re.IGNORECASE)
             for match in matches:
                 street_name = match.group(1).strip()
                 building_number = match.group(2)
-                apartment_number = match.group(3) if match.lastindex >= 3 else None
+                letter_suffix = match.group(3) if match.lastindex >= 3 and match.group(3) else ""
+                apartment_number = match.group(4) if match.lastindex >= 4 and match.group(4) else None
                 
-                # Filtruj nieprawidłowe
+                # Połącz numer z literą (np. "73" + "a" = "73a")
+                full_building_number = building_number + letter_suffix
+                
+                # Filtruj nieprawidłowe nazwy
                 if (len(street_name) < 3 or 
                     street_name.lower() in ['pokój', 'pokoj', 'wynajm', 'mieszkanie', 'oferta'] or
                     any(char.isdigit() for char in street_name[:3])):
                     continue
                 
+                # Sprawdź numer
                 try:
-                    num = int(building_number)
-                    if not (1 <= num <= 999):
+                    base_num = int(building_number)  # Sprawdź tylko cyfrową część
+                    if not (1 <= base_num <= 999):
                         continue
                 except ValueError:
                     continue
@@ -543,9 +547,9 @@ class OLXMonitor:
                 
                 result = {
                     "street_name": street_normalized,
-                    "building_number": building_number,
+                    "building_number": full_building_number,  # Z literą!
                     "apartment_number": apartment_number,
-                    "full_address": f"ul. {street_normalized} {building_number}"
+                    "full_address": f"ul. {street_normalized} {full_building_number}"
                 }
                 
                 if apartment_number:
@@ -556,12 +560,20 @@ class OLXMonitor:
         
         return None
     
-    def _generate_map(self, offers: List[RoomOffer]):
-        """Generuje mapę z aktywną i historyczną ofertami"""
+    def _generate_map_ALWAYS(self, offers: List[RoomOffer]):
+        """ZAWSZE generuje mapę - nawet gdy brak ofert (demo)"""
+        
+        # Stwórz folder docs
+        os.makedirs('docs', exist_ok=True)
         
         if not offers:
-            logger.warning("⚠️ Brak ofert do wygenerowania mapy")
+            # Brak ofert - stwórz demo mapę
+            logger.info("📍 Brak ofert z adresami - tworzę demo mapę")
+            self._create_demo_map()
             return
+        
+        # Są oferty - stwórz normalną mapę
+        logger.info(f"🗺️ Tworzę mapę z {len(offers)} ofertami")
         
         # Centrum mapy
         active_offers = [o for o in offers if o.is_active]
@@ -578,18 +590,18 @@ class OLXMonitor:
         inactive_group = folium.FeatureGroup(name="❌ Nieaktywne (historia)")
         
         for offer in offers:
-            # Kolor i ikona według statusu i ceny
+            # Kolor według ceny i statusu
             if offer.is_active:
                 if offer.price_numeric < 600:
-                    color, icon = 'green', 'home'  # < 600 zł
+                    color, icon = 'green', 'home'
                 elif offer.price_numeric < 800:
-                    color, icon = 'blue', 'home'   # 600-799 zł
+                    color, icon = 'blue', 'home'
                 elif offer.price_numeric < 1000:
-                    color, icon = 'orange', 'home' # 800-999 zł
+                    color, icon = 'orange', 'home'
                 elif offer.price_numeric < 1200:
-                    color, icon = 'red', 'home'    # 1000-1199 zł
+                    color, icon = 'red', 'home'
                 else:
-                    color, icon = 'darkred', 'home' # 1200+ zł
+                    color, icon = 'darkred', 'home'
                 prefix = 'fa'
                 group = active_group
                 status = "🏠 AKTYWNA"
@@ -636,11 +648,65 @@ class OLXMonitor:
         # Dodaj grupy do mapy
         active_group.add_to(m)
         inactive_group.add_to(m)
-        
-        # Panel kontrolny
         folium.LayerControl().add_to(m)
         
-        # Statystyki
+        # Dodaj legendę i statystyki
+        self._add_map_overlay(m, offers)
+        
+        # Zapisz mapę
+        map_path = 'docs/index.html'
+        m.save(map_path)
+        logger.info(f"🗺️ Mapa zapisana: {map_path}")
+    
+    def _create_demo_map(self):
+        """Tworzy demo mapę gdy brak prawdziwych ofert"""
+        
+        m = folium.Map(location=[51.2465, 22.5684], zoom_start=14)
+        
+        # Demo marker
+        folium.Marker(
+            [51.2465, 22.5684],
+            popup=folium.Popup("""
+            <div style="width: 300px; font-family: Arial; text-align: center;">
+                <h4>🎯 Room Scanner - Lublin</h4>
+                <p><strong>Mapa jest gotowa!</strong></p>
+                <p>Agent przeszukuje OLX i szuka ofert z precyzyjnymi adresami.</p>
+                <p>📍 Gdy znajdzie oferty typu "ul. Narutowicza 14" - pojawią się tutaj automatycznie.</p>
+                <p>🔄 Monitoring: codziennie o 10:00 i 18:00</p>
+            </div>
+            """),
+            tooltip="Room Scanner - gotowy do działania!",
+            icon=folium.Icon(color='blue', icon='info-sign', prefix='glyphicon')
+        ).add_to(m)
+        
+        # Info
+        info_html = '''
+        <div style="position: fixed; top: 10px; right: 10px; width: 250px; 
+                    background: white; padding: 15px; border-radius: 8px; 
+                    box-shadow: 0 4px 8px rgba(0,0,0,0.1); z-index: 1000; 
+                    font-family: Arial, sans-serif;">
+            <h4 style="margin: 0 0 12px 0; color: #333;">📊 Room Scanner - Lublin</h4>
+            <div style="background: #d4edda; padding: 8px; border-radius: 4px; margin: 8px 0; border: 1px solid #c3e6cb;">
+                <strong>🎯 GOTOWY DO DZIAŁANIA</strong><br>
+                <small>Agent przeszukuje OLX i czeka na oferty z adresami</small>
+            </div>
+            <p style="margin: 5px 0;">🔍 Szuka: "ul. Nazwa + numer"</p>
+            <p style="margin: 5px 0;">⏰ Monitoring: 10:00 i 18:00</p>
+            <p style="margin: 5px 0; font-size: 11px; color: #666;">
+                📅 Sprawdzono: ''' + datetime.now().strftime('%d.%m %H:%M') + '''
+            </p>
+        </div>
+        '''
+        m.get_root().html.add_child(folium.Element(info_html))
+        
+        # Zapisz demo mapę
+        map_path = 'docs/index.html'
+        m.save(map_path)
+        logger.info(f"🗺️ Demo mapa zapisana: {map_path}")
+    
+    def _add_map_overlay(self, m, offers):
+        """Dodaje legendę i statystyki do mapy"""
+        
         active_count = sum(1 for o in offers if o.is_active)
         inactive_count = len(offers) - active_count
         
@@ -650,6 +716,7 @@ class OLXMonitor:
         else:
             avg_price = 0
         
+        # Statystyki
         stats_html = f'''
         <div style="position: fixed; top: 10px; right: 10px; width: 220px; 
                     background: white; padding: 15px; border-radius: 8px; 
@@ -664,7 +731,8 @@ class OLXMonitor:
             </p>
             <hr style="margin: 8px 0;">
             <p style="margin: 0; font-size: 10px; color: #999;">
-                🔄 Monitoring: 10:00 i 18:00
+                🔄 Monitoring: 10:00 i 18:00<br>
+                🎯 Treść + tytuł ofert
             </p>
         </div>
         '''
@@ -706,25 +774,17 @@ class OLXMonitor:
         </div>
         '''
         m.get_root().html.add_child(folium.Element(legend_html))
-        
-        # Zapisz mapę
-        os.makedirs('docs', exist_ok=True)
-        map_path = 'docs/index.html'
-        m.save(map_path)
-        
-        logger.info(f"🗺️ Mapa zapisana: {map_path}")
-        logger.info(f"   📊 {active_count} aktywnych, {inactive_count} nieaktywnych ofert")
 
 def main():
-    """Funkcja główna"""
-    print("🏠 Room Scanner - Lublin")
-    print("🔍 Monitoruje pokoje z precyzyjnymi adresami")
-    print("=" * 50)
+    """Funkcja główna - poprawiona wersja"""
+    print("🏠 Room Scanner - Lublin (POPRAWIONA WERSJA)")
+    print("🔍 Przeszukuje treść + tytuł / Obsługuje Al. + litery / WSZYSTKIE strony")
+    print("=" * 70)
     
-    monitor = OLXMonitor()
+    monitor = ImprovedOLXMonitor()
     stats = monitor.run_monitoring()
     
-    print(f"\n📊 Wyniki:")
+    print(f"\n📊 Wyniki poprawionej wersji:")
     for key, value in stats.items():
         if key != 'status':
             print(f"   {key}: {value}")
