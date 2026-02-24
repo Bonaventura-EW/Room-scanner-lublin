@@ -9,12 +9,6 @@ on:
   
   # Pozwala na ręczne uruchomienie
   workflow_dispatch:
-    inputs:
-      debug_mode:
-        description: 'Enable debug logging'
-        required: false
-        default: 'false'
-        type: boolean
 
 # Pozwolenia dla GitHub Pages
 permissions:
@@ -34,6 +28,8 @@ jobs:
     steps:
     - name: 🏠 Checkout repository
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
       
     - name: 🐍 Set up Python
       uses: actions/setup-python@v5
@@ -44,47 +40,60 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-
           
     - name: 📥 Install dependencies
       run: |
-        pip install --upgrade pip
-        pip install requests beautifulsoup4 folium lxml schedule
+        python -m pip install --upgrade pip setuptools wheel
+        pip install -r requirements.txt --quiet
         
     - name: 🗂️ Create data directories
       run: |
         mkdir -p data
         mkdir -p docs
+        touch data/.gitkeep
         
-    - name: 💾 Restore database and cache
+    - name: 💾 Restore database cache
       uses: actions/cache@v4
       with:
-        path: |
-          data/
-        key: room-scanner-data-${{ github.run_number }}
+        path: data/
+        key: room-scanner-data-${{ github.run_id }}
         restore-keys: |
           room-scanner-data-
           
     - name: 🔍 Run Room Scanner
+      id: scan
       run: |
         echo "🚀 Starting Room Scanner - Lublin at $(date)"
-        python olx_room_monitor.py
+        python olx_room_monitor.py 2>&1 | tee scan_output.log
         echo "✅ Monitoring completed at $(date)"
+      continue-on-error: true
         
     - name: 📊 Display statistics
+      if: always()
       run: |
+        echo "📋 SCAN RESULTS:"
+        if [ -f scan_output.log ]; then
+          tail -20 scan_output.log
+        fi
+        
         if [ -f data/olx_rooms.db ]; then
+          echo ""
           echo "📊 Database statistics:"
-          sqlite3 data/olx_rooms.db "SELECT COUNT(*) as total_offers FROM offers;" || echo "No data yet"
-          sqlite3 data/olx_rooms.db "SELECT COUNT(*) as active_offers FROM offers WHERE is_active=1;" || echo "No active offers"
-          sqlite3 data/olx_rooms.db "SELECT COUNT(*) as inactive_offers FROM offers WHERE is_active=0;" || echo "No inactive offers"
+          sqlite3 data/olx_rooms.db "SELECT COUNT(*) as total_offers FROM offers;" 2>/dev/null || echo "Database exists but query failed"
+          sqlite3 data/olx_rooms.db "SELECT COUNT(*) as active_offers FROM offers WHERE is_active=1;" 2>/dev/null || echo "N/A"
+          sqlite3 data/olx_rooms.db "SELECT COUNT(*) as inactive_offers FROM offers WHERE is_active=0;" 2>/dev/null || echo "N/A"
+        else
+          echo "⚠️ Database not found yet (first run?)"
         fi
         
         if [ -f docs/index.html ]; then
-          echo "🗺️ Map generated successfully"
-          ls -la docs/
+          echo "✅ Map generated successfully"
+          ls -lh docs/
+        else
+          echo "⚠️ Map not generated"
         fi
         
     - name: 🗺️ Setup GitHub Pages
@@ -94,16 +103,19 @@ jobs:
       uses: actions/upload-pages-artifact@v3
       with:
         path: 'docs'
+      continue-on-error: true
         
     - name: 🌐 Deploy to GitHub Pages
       id: deployment
       uses: actions/deploy-pages@v4
+      continue-on-error: true
       
-    - name: 📋 Create summary report
+    - name: 📋 Create detailed summary
+      if: always()
       run: |
         echo "# 🏠 Room Scanner - Lublin Report" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**Monitoring completed at:** $(date)" >> $GITHUB_STEP_SUMMARY
+        echo "**Monitoring completed at:** $(date '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         
         if [ -f data/olx_rooms.db ]; then
@@ -116,25 +128,53 @@ jobs:
           echo "- **Currently active:** $ACTIVE" >> $GITHUB_STEP_SUMMARY
           echo "- **Historical (inactive):** $INACTIVE" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-        fi
-        
-        if [ -f docs/index.html ]; then
-          echo "## 🗺️ Interactive Map" >> $GITHUB_STEP_SUMMARY
-          echo "Map has been updated and deployed to: ${{ steps.deployment.outputs.page_url }}" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "## ⚠️ Note" >> $GITHUB_STEP_SUMMARY
+          echo "Database will be created on first run. Check next execution for statistics." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
         fi
         
-        echo "## ⏰ Next Monitoring" >> $GITHUB_STEP_SUMMARY
-        echo "- **Next scheduled run:** Daily at 10:00 and 18:00 UTC" >> $GITHUB_STEP_SUMMARY
-        echo "- **Time zone:** Poland (UTC+1/UTC+2)" >> $GITHUB_STEP_SUMMARY
+        if [ -f docs/index.html ]; then
+          FILESIZE=$(du -h docs/index.html | cut -f1)
+          echo "## 🗺️ Interactive Map" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Map generated successfully ($FILESIZE)" >> $GITHUB_STEP_SUMMARY
+          if [ ! -z "${{ steps.deployment.outputs.page_url }}" ]; then
+            echo "📍 **View here:** [${{ steps.deployment.outputs.page_url }}](${{ steps.deployment.outputs.page_url }})" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "## ⚠️ Map" >> $GITHUB_STEP_SUMMARY
+          echo "Map will be generated once addresses are found." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
         
-    - name: ❌ Handle errors
-      if: failure()
+        echo "## ⏰ Schedule" >> $GITHUB_STEP_SUMMARY
+        echo "- **Frequency:** 2 times daily" >> $GITHUB_STEP_SUMMARY
+        echo "- **Times:** 10:00 and 18:00 UTC" >> $GITHUB_STEP_SUMMARY
+        echo "- **Timezone:** Poland (UTC+1/UTC+2)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "## 📝 Latest Scan Log" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        if [ -f scan_output.log ]; then
+          tail -15 scan_output.log >> $GITHUB_STEP_SUMMARY
+        else
+          echo "No log file found" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        
+    - name: 🔄 Commit changes (if any)
+      if: always()
       run: |
-        echo "❌ Monitoring failed!" >> $GITHUB_STEP_SUMMARY
-        echo "Check the logs above for details." >> $GITHUB_STEP_SUMMARY
+        git config --local user.email "action@github.com"
+        git config --local user.name "Room Scanner Bot"
         
-        # Try to preserve any partial data
-        if [ -f data/olx_rooms.db ]; then
-          echo "💾 Database preserved for next run" >> $GITHUB_STEP_SUMMARY
+        if [ -f docs/index.html ]; then
+          git add docs/index.html 2>/dev/null || true
+          git add data/geocoding_cache.json 2>/dev/null || true
+          
+          if ! git diff --cached --quiet; then
+            git commit -m "🗺️ Update map - $(date '+%Y-%m-%d %H:%M')" || true
+            git push || true
+          fi
         fi
